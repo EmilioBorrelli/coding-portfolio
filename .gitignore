@@ -1,0 +1,51 @@
+# ==================================================
+# C++ (Image Processing C++)
+# ==================================================
+
+# Ignore all build folders anywhere
+build/
+*/build/
+
+# CMake artifacts
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+Makefile
+compile_commands.json
+
+# Compiled binaries
+*.exe
+*.obj
+*.pdb
+*.ilk
+*.dll
+*.lib
+
+# ==================================================
+# Python (EEG pipeline)
+# ==================================================
+
+# Virtual environments (even nested ones)
+venv/
+*/venv/
+
+# Python cache
+__pycache__/
+*/__pycache__/
+
+# Python compiled files
+*.pyc
+*.pyo
+*.pyd
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# ==================================================
+# IDE / OS
+# ==================================================
+
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
