@@ -15,6 +15,7 @@
 #include "algorithms/helpers/nonMaxSuppression.hpp"
 #include "algorithms/helpers/doubleThreshold.hpp"
 #include "algorithms/helpers/hysteresis.hpp"
+#include "algorithms/helpers/createSeedMap.hpp"
 
 #include "algorithms/pipeline/canny.hpp"
 #include "algorithms/pipeline/laplacianOfGaussian.hpp"
@@ -92,7 +93,7 @@ int main()
     // Load
     // --------------------------------------------------
     Image<float> imgF;
-    if (!imgF.load("rubberwhale1.png")) {
+    if (!imgF.load("../assets/rubberwhale.png")) {
         std::cerr << "Failed to load image\n";
         return 1;
     }
@@ -354,6 +355,36 @@ int main()
     std::cout << "Descriptors computed: "
             << descriptors.size() << std::endl;
 
+    cv::waitKey(0);
+
+    auto seeds = alg::createSeedMap(
+    filtered,
+    imgF.width(),
+    imgF.height()
+    );
+    showScaled("Seed Map", toCvMat(seeds));
+
+    cv::Mat seedVis = cv::Mat::zeros(imgF.height(), imgF.width(), CV_8UC3);
+
+    for (const auto& kp : filtered)
+    {
+        int scaleFactor = 1 << kp.octave;
+        int x = kp.x * scaleFactor;
+        int y = kp.y * scaleFactor;
+
+        cv::circle(seedVis, cv::Point(x, y), 3, cv::Scalar(255,255,255), -1);
+    }
+
+    showScaled("Seed Map Debug", seedVis);
+    cv::waitKey(0);
+    
+    int seedCount = 0;
+    for (auto v : seeds.data())
+    {
+        if (v > 0) ++seedCount;
+    }
+    std::cout << "Seed pixels: " << seedCount << std::endl;
+    
     cv::waitKey(0);
  
     
