@@ -37,7 +37,7 @@ from dataclasses import dataclass, asdict, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from scipy.spatial import cKDTree  # noqa: E402
-
+from scipy.signal import butter, filtfilt
 import numpy as np
 import pandas as pd
 import mne
@@ -145,12 +145,12 @@ class PipelineConfig:
     annotate_bad_time: bool = True
     bad_time_win_sec: float = 1.0
     bad_time_overlap: float = 0.5
-    bad_time_z_thresh: float = 9.0
+    bad_time_z_thresh: float = 6.5
     bad_time_frac_ch_amp: float = 0.25
     bad_time_flat_std_uv: float = 0.5
     bad_time_frac_ch_flat: float = 0.25
     bad_time_hf_band: Tuple[float, float] = (30.0, 100.0)
-    bad_time_hf_rise_db: float = 8.0
+    bad_time_hf_rise_db: float = 6.5
     bad_time_min_span: float = 0.25
     hard_drop_long_sec: Optional[float] = None
 
@@ -268,8 +268,7 @@ def capture_environment() -> Dict[str, Any]:
 
 def ensure_finite_data(raw: mne.io.BaseRaw) -> mne.io.BaseRaw:
     r = raw.copy()
-    r.load_data()
-    data = r.get_data()
+    data = r._data
     if not np.all(np.isfinite(data)):
         data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
         r._data[:] = data
@@ -351,13 +350,20 @@ def _psd_median(raw: mne.io.BaseRaw, fmin=0.01, fmax=140.0, nperseg_sec=2.0):
     f, P = welch(
         raw.get_data(picks=picks),
         fs=sf,
-        nperseg=int(max(8, nperseg_sec * sf)),
+        nperseg=min(512, int(nperseg_sec * sf)),
         axis=-1,
         average="median",
     )
     keep = (f >= fmin) & (f <= fmax)
     return f[keep], np.median(P[:, keep], axis=0) if P.ndim == 2 else P[keep]
 
+_psd_cache = {}
+
+def _psd_median_cached(raw, fmin=0.01, fmax=140.0, nperseg_sec=2.0):
+    key = (id(raw), fmin, fmax, nperseg_sec)
+    if key not in _psd_cache:
+        _psd_cache[key] = _psd_median(raw, fmin, fmax, nperseg_sec)
+    return _psd_cache[key]
 
 def _bandpower(f: np.ndarray, P: np.ndarray, band: Tuple[float, float]) -> float:
     idx = (f >= band[0]) & (f <= band[1])
@@ -374,12 +380,12 @@ def _bandpowers_dict(raw: mne.io.BaseRaw, fmin=1, fmax=60) -> Dict[str, float]:
         "beta": (13, 30),
         "gamma": (30, 45),
     }
-    f, P = _psd_median(raw, fmin=fmin, fmax=fmax)
+    f, P = _psd_median_cached(raw, fmin=fmin, fmax=fmax)
     return {name: _bandpower(f, P, rng) for name, rng in bands.items()}
 
 
 def _residual_peak_prom_db(raw: mne.io.BaseRaw, f0: float) -> float:
-    f, P = _psd_median(raw, fmin=max(1, f0 - 6), fmax=f0 + 6)
+    f, P = _psd_median_cached(raw, fmin=max(1, f0 - 6), fmax=f0 + 6)
     psd_db = 10 * np.log10(P + 1e-20)
     win = (f >= f0 - 1.5) & (f <= f0 + 1.5)
     if not np.any(win):
@@ -392,7 +398,7 @@ def _residual_peak_prom_db(raw: mne.io.BaseRaw, f0: float) -> float:
 
 def _shoulder_drop_pct(before: mne.io.BaseRaw, after: mne.io.BaseRaw, f0=50.0, gap=0.7, span=2.0) -> float:
     def bandpow(r: mne.io.BaseRaw, lo: float, hi: float) -> float:
-        fb, Pb = _psd_median(r, fmin=lo, fmax=hi)
+        fb, Pb = _psd_median_cached(r, fmin=lo, fmax=hi)
         return float(np.trapz(Pb, fb))
 
     left = (f0 - span, f0 - gap)
@@ -405,8 +411,8 @@ def _shoulder_drop_pct(before: mne.io.BaseRaw, after: mne.io.BaseRaw, f0=50.0, g
 def _band_change_pct(before: mne.io.BaseRaw, after: mne.io.BaseRaw, bands=((8, 12), (13, 30))) -> float:
     vals: List[float] = []
     for lo, hi in bands:
-        fb, Pb = _psd_median(before, fmin=lo, fmax=hi)
-        fa, Pa = _psd_median(after, fmin=lo, fmax=hi)
+        fb, Pb = _psd_median_cached(before, fmin=lo, fmax=hi)
+        fa, Pa = _psd_median_cached(after, fmin=lo, fmax=hi)
         bb = float(np.trapz(Pb, fb))
         aa = float(np.trapz(Pa, fa))
         vals.append(100.0 * (aa - (bb + 1e-20)) / (bb + 1e-20))
@@ -500,25 +506,42 @@ def _compute_neighbor_radius(
 _DEF_F0_GUESS = (50.0, 60.0)
 
 
-def _detect_mains_f0(raw: mne.io.BaseRaw, guess: Tuple[float, ...] = _DEF_F0_GUESS) -> Tuple[Optional[float], float]:
+def _detect_mains_f0(raw, guess=(50.0, 60.0)):
     sf = raw.info["sfreq"]
     picks = mne.pick_types(raw.info, eeg=True, exclude="bads")
-    f, Pxx = welch(raw.get_data(picks=picks), fs=sf, nperseg=int(8 * sf), axis=-1, average="median")
-    psd = np.median(Pxx, axis=0)
-    psd_db = 10 * np.log10(psd + 1e-20)
 
-    best = (None, -np.inf)
+    f, P = welch(
+        raw.get_data(picks=picks),
+        fs=sf,
+        nperseg=int(10 * sf),
+        axis=-1,
+        average="median"
+    )
+
+    psd = np.median(P, axis=0)
+
+    best_freq = None
+    best_prom = -np.inf
+
     for g in guess:
-        win = (f >= g - 2) & (f <= g + 2)
-        if not np.any(win):
+        mask = (f > g - 2) & (f < g + 2)
+        if not np.any(mask):
             continue
-        pk = float(np.max(psd_db[win]))
-        hood = (f >= g - 5) & (f <= g + 5) & (np.abs(f - g) > 0.8)
-        base = float(np.median(psd_db[hood])) if np.any(hood) else float(np.median(psd_db))
-        prom_db = pk - base
-        if prom_db > best[1]:
-            best = (g, prom_db)
-    return best  # (f0, prom_db)
+
+        f_local = f[mask]
+        psd_local = psd[mask]
+
+        idx = np.argmax(psd_local)
+        peak_freq = float(f_local[idx])
+
+        baseline = np.median(psd_local)
+        prom = psd_local[idx] / (baseline + 1e-20)
+
+        if prom > best_prom:
+            best_prom = prom
+            best_freq = peak_freq
+
+    return best_freq, float(best_prom)
 
 
 def _iir_notch(raw: mne.io.BaseRaw, f0: float, Q: float) -> mne.io.BaseRaw:
@@ -529,79 +552,31 @@ def _iir_notch(raw: mne.io.BaseRaw, f0: float, Q: float) -> mne.io.BaseRaw:
     return out
 
 
-def line_noise_bestof_safe(raw: mne.io.BaseRaw) -> Tuple[mne.io.BaseRaw, Dict[str, Any]]:
+def line_noise_precise(raw):
     f0, prom = _detect_mains_f0(raw)
-    if f0 is None or prom < 0.5:
-        return raw.copy(), {"stage": "skip", "detected_f0": f0, "prom_db": prom}
+
+    if f0 is None or prom < 1.2:
+        return raw.copy(), {"stage": "skip", "detected_f0": f0}
 
     sf = raw.info["sfreq"]
-    df_grid = (-0.30, -0.15, 0.0, +0.15, +0.30)
-    q_grid = (160.0, 200.0, 240.0)
 
-    def eval_candidate(name: str, r_after: mne.io.BaseRaw) -> Dict[str, Any]:
-        resid = _residual_peak_prom_db(r_after, f0)
-        # Include 2*f0 residue a bit
-        resid2 = 0.0
-        if 2 * f0 < sf / 2 - 1:
-            resid2 = max(0.0, _residual_peak_prom_db(r_after, 2 * f0))
-        resid_mix = 0.7 * max(0.0, resid) + 0.3 * resid2
-        shoulder = _shoulder_drop_pct(raw, r_after, f0=f0)
-        bandchg = _band_change_pct(raw, r_after)
-        J = 1.2 * resid_mix + 0.25 * max(0.0, shoulder - 12.0) + 0.25 * abs(bandchg)
-        return {
-            "name": name,
-            "J": J,
-            "resid_db": resid_mix,
-            "shoulder_drop_pct": shoulder,
-            "band_change_pct": bandchg,
-        }
+    # Narrow notch
+    Q = 250.0
 
-    candidates: List[Tuple[Dict[str, Any], mne.io.BaseRaw]] = []
+    r = _iir_notch(raw, f0, Q)
 
-    # IIR notch grid + optional 2*f0 notch
-    for Q in q_grid:
-        for df in df_grid:
-            r1 = _iir_notch(raw, f0 + df, Q)
-            if 2 * f0 < sf / 2 - 1:
-                if _residual_peak_prom_db(r1, 2 * f0) >= 1.0:
-                    r1 = _iir_notch(r1, 2 * f0, 130.0)
-            rec = eval_candidate(f"iir_Q{Q}_df{df:+.2f}", r1)
-            candidates.append((rec, r1))
+    # Remove harmonic if necessary
+    if 2 * f0 < sf / 2 - 1:
+        resid = _residual_peak_prom_db(r, 2 * f0)
 
-    # Spectrum-fit notch (MNE)
-    try:
-        freqs = [f0]
-        if 2 * f0 < sf / 2 - 1:
-            freqs.append(2 * f0)
-        r2 = raw.copy().notch_filter(freqs=freqs, method="spectrum_fit", mt_bandwidth=1.2, p_value=0.01, phase="zero")
-        rec2 = eval_candidate("spectrum_fit_bw1.2_p0.01", r2)
-        candidates.append((rec2, r2))
-    except Exception:
-        pass
+        if resid > 1.0:
+            r = _iir_notch(r, 2 * f0, 160.0)
 
-    best = sorted(candidates, key=lambda t: t[0]["J"])[0]
-    rec, rbest = best
-
-    # Gentle final sweep
-    if not (rec["resid_db"] <= 1.0 and abs(rec["band_change_pct"]) <= 2.0 and rec["shoulder_drop_pct"] <= 10.0):
-        rbest = _iir_notch(rbest, f0, 220.0)
-        if 2 * f0 < sf / 2 - 1:
-            if _residual_peak_prom_db(rbest, 2 * f0) >= 0.8:
-                rbest = _iir_notch(rbest, 2 * f0, 160.0)
-        # recompute quick metrics
-        rec.update({
-            "resid_db": _residual_peak_prom_db(rbest, f0),
-            "shoulder_drop_pct": _shoulder_drop_pct(raw, rbest, f0=f0),
-            "band_change_pct": _band_change_pct(raw, rbest),
-            "name": rec["name"] + "+final_sweep",
-            "stage": "bestof",
-            "detected_f0": f0,
-            "prom_db": prom,
-        })
-    else:
-        rec.update({"stage": "bestof", "detected_f0": f0, "prom_db": prom})
-
-    return rbest, rec
+    return r, {
+        "stage": "precise_notch",
+        "detected_f0": float(f0),
+        "Q": Q,
+    }
 
 
 def adaptive_highpass(
@@ -611,7 +586,7 @@ def adaptive_highpass(
     band_tol: float,
 ) -> Tuple[mne.io.BaseRaw, Dict[str, Any]]:
     # Measure baseline
-    f0, P0 = _psd_median(raw, fmin=0.01, fmax=min(140.0, raw.info["sfreq"] / 2 - 1))
+    f0, P0 = _psd_median_cached(raw, fmin=0.01, fmax=min(140.0, raw.info["sfreq"] / 2 - 1))
     def bp(band):
         return _bandpower(f0, P0, band)
     vlf0 = bp((0.1, 0.5))
@@ -621,8 +596,15 @@ def adaptive_highpass(
     rows = []
     best_raw = None
     for hp in candidates:
-        r = raw.copy().filter(l_freq=hp, h_freq=None, method="fir", phase="zero", verbose=False)
-        f, P = _psd_median(r, fmin=0.01, fmax=min(140.0, r.info["sfreq"] / 2 - 1))
+        # r = raw.copy().filter(l_freq=hp, h_freq=None, method="fir", phase="zero", verbose=False)
+        r = raw.copy().filter(
+            l_freq=hp,
+            h_freq=None,
+            method="fir",
+            phase="zero",
+            verbose=False
+        )
+        f, P = _psd_median_cached(r, fmin=0.01, fmax=min(140.0, r.info["sfreq"] / 2 - 1))
         vlf = _bandpower(f, P, (0.1, 0.5))
         a = _bandpower(f, P, (8, 12))
         b = _bandpower(f, P, (13, 30))
@@ -700,11 +682,17 @@ def annotate_bad_time(raw: mne.io.BaseRaw, cfg: PipelineConfig) -> Tuple[mne.io.
         keep = (f >= cfg.bad_time_hf_band[0]) & (f <= cfg.bad_time_hf_band[1])
         return 10 * math.log10(float(np.median(np.trapz(P[:, keep], f[keep], axis=1))) + 1e-20)
 
+    
+
+    # precompute HF band
+    b, a = butter(4, np.array(cfg.bad_time_hf_band) / (sf / 2), btype="band")
+    hf_data = filtfilt(b, a, data, axis=1)
+
     hf_db_windows: List[float] = []
     for start in range(0, T - size + 1, step):
         sl = slice(start, start + size)
-        hf_db_windows.append(hf_power_db(sl))
-    base_db = hf_db_windows[0] if hf_db_windows else 0.0
+        hf_db_windows.append(10*np.log10(np.mean(hf_data[:, sl]**2)+1e-20))
+    base_db = np.median(hf_db_windows) if hf_db_windows else 0.0
 
     spans: List[Tuple[float, float, List[str]]] = []
     for w, start in enumerate(range(0, T - size + 1, step)):
@@ -814,7 +802,7 @@ def ensure_positions(raw: mne.io.BaseRaw) -> mne.io.BaseRaw:
 
 def sanitize_nonfinite(raw: mne.io.BaseRaw) -> Tuple[mne.io.BaseRaw, List[str], Dict[str, int]]:
     r = raw.copy()
-    data = r.get_data()
+    data = r._data
     nonfin = ~np.isfinite(data)
     dropped: List[str] = []
     filled: Dict[str, int] = {}
@@ -826,7 +814,7 @@ def sanitize_nonfinite(raw: mne.io.BaseRaw) -> Tuple[mne.io.BaseRaw, List[str], 
                 dropped.append(ch)
         if dropped:
             r.drop_channels(dropped)
-            data = r.get_data()
+            data = r._data
             nonfin = ~np.isfinite(data)
         if nonfin.any():
             data = np.nan_to_num(data, nan=0.0, posinf=0.0, neginf=0.0)
@@ -847,7 +835,7 @@ def detection_view(raw: mne.io.BaseRaw) -> mne.io.BaseRaw:
     return r
 
 
-def detect_bad_channels(raw_for_metrics: mne.io.BaseRaw, corr_k=2.0, var_k=3.0, flat_std_uv=1e-3) -> Tuple[List[str], Dict[str, Any]]:
+def detect_bad_channels(raw_for_metrics: mne.io.BaseRaw, corr_k=2.5, var_k=3.5, flat_std_uv=1e-3) -> Tuple[List[str], Dict[str, Any]]:
     picks = mne.pick_types(raw_for_metrics.info, eeg=True, exclude="bads")
     ch_names = [raw_for_metrics.ch_names[p] for p in picks]
     epochs = mne.make_fixed_length_epochs(raw_for_metrics, duration=2.0, overlap=1.0, preload=True, reject_by_annotation=True)
@@ -855,10 +843,43 @@ def detect_bad_channels(raw_for_metrics: mne.io.BaseRaw, corr_k=2.0, var_k=3.0, 
     X = epochs.get_data()  # (n_ep, n_ch, n_t)
     var_ch = np.var(X, axis=(0, 2))
     mean_corr = []
+    # for e in range(X.shape[0]):
+    #     C = np.corrcoef(X[e])
+    #     C = np.nan_to_num(C, nan=0.0)
+    #     mean_corr.append((C.sum(axis=1) - 1.0) / max(1, (X.shape[1] - 1)))
+
+    pos = _get_montage_pos(raw_for_metrics)
+
+    neighbor_map = {}
+    for ch in ch_names:
+        if ch not in pos:
+            neighbor_map[ch] = ch_names
+            continue
+
+        dists = {
+            other: np.linalg.norm(pos[ch] - pos[other])
+            for other in ch_names if other != ch and other in pos
+        }
+
+        nearest = sorted(dists, key=dists.get)[:6]
+        neighbor_map[ch] = nearest
+
     for e in range(X.shape[0]):
         C = np.corrcoef(X[e])
         C = np.nan_to_num(C, nan=0.0)
-        mean_corr.append((C.sum(axis=1) - 1.0) / max(1, (X.shape[1] - 1)))
+
+        corr_vec = []
+        for i, ch in enumerate(ch_names):
+            neigh = neighbor_map[ch]
+            idx = [ch_names.index(n) for n in neigh if n in ch_names]
+
+            if not idx:
+                corr_vec.append(0)
+            else:
+                corr_vec.append(np.mean(C[i, idx]))
+
+        mean_corr.append(corr_vec)
+
     mean_corr = np.mean(mean_corr, axis=0)
     std_ch_uv = np.std(X * 1e6, axis=(0, 2))
 
@@ -874,7 +895,22 @@ def detect_bad_channels(raw_for_metrics: mne.io.BaseRaw, corr_k=2.0, var_k=3.0, 
     med_c, mad_c = rob(mean_corr)
     corr_thr = med_c - corr_k * mad_c
 
-    bad_high_var = [ch_names[i] for i, v in enumerate(var_ch) if v > var_hi_thr]
+    # bad_high_var = [ch_names[i] for i, v in enumerate(var_ch) if v > var_hi_thr]
+    bad_high_var = []
+    for i, v in enumerate(var_ch):
+        if v <= var_hi_thr:
+            continue
+        # variance per epoch
+        ep_var = np.var(X[:, i, :], axis=1)
+        med = np.median(ep_var)
+        mad = np.median(np.abs(ep_var - med)) + 1e-20
+        z = (ep_var - med) / (1.4826 * mad)
+        spike_frac = np.mean(z > 6)
+        # If spikes occur only in few epochs → treat as artifact spike
+        if spike_frac < 0.1:
+            continue
+        bad_high_var.append(ch_names[i])
+
     bad_low_var = [ch_names[i] for i, v in enumerate(var_ch) if v < var_lo_thr]
     bad_low_corr = [ch_names[i] for i, c in enumerate(mean_corr) if c < corr_thr]
     bad_flat = [ch_names[i] for i, s in enumerate(std_ch_uv) if s < flat_std_uv]
@@ -909,7 +945,7 @@ def interpolate_bad_channels(raw: mne.io.BaseRaw, cfg: StageThresholds) -> Tuple
     metrics_view = detection_view(r)
 
     # --- 1) Initial detection using your existing logic ---
-    corr_k, var_k = 2.0, 3.0
+    corr_k, var_k = 2.5, 3.5
     bads, rep = detect_bad_channels(metrics_view, corr_k=corr_k, var_k=var_k)
 
     n_ch = len(mne.pick_types(r.info, eeg=True))
@@ -1079,7 +1115,7 @@ def adaptive_rereference(raw: mne.io.BaseRaw) -> Tuple[mne.io.BaseRaw, Dict[str,
 # -----------------------------
 
 def _alpha_bandpower(raw, band=(8,12)):
-    f, P = _psd_median(raw, fmin=1, fmax=45)
+    f, P = _psd_median_cached(raw, fmin=1, fmax=45)
     m = (f >= band[0]) & (f <= band[1])
     return float(np.trapz(P[m], f[m])) if np.any(m) else float("nan")
 
@@ -1115,7 +1151,7 @@ def run_ica_iclabel(
     # band-pass for ICA fit
     r_bp = r.copy().filter(l_freq=1.0, h_freq=100.0, verbose=False)
 
-    n_comp = max(5, min(len(r_bp.ch_names) - 1, 20))
+    n_comp = int(min(len(r_bp.ch_names) * 0.95, len(r_bp.ch_names) - 1))
 
     ica = ICA(
         n_components=n_comp,
@@ -1124,7 +1160,14 @@ def run_ica_iclabel(
         random_state=random_state,
         max_iter="auto",
     )
-    ica.fit(r_bp, reject_by_annotation=True)
+    # Train ICA only on clean segments
+    r_fit = extract_clean_only_raw(r_bp)
+
+    # limit training size for speed
+    if r_fit.times[-1] > 180:
+        r_fit = r_fit.crop(tmin=0, tmax=180)
+
+    ica.fit(r_fit, reject_by_annotation=True)
 
     # ---------- ICLabel ----------
     labels, confidences = [], []
@@ -1260,7 +1303,9 @@ def run_asr_with_fallback(raw: mne.io.BaseRaw, cfg: PipelineConfig, thr: StageTh
 
     dur = raw.times[-1]
     cal_dur = max(cfg.asr_cal_min_dur, min(cfg.asr_cal_max_dur, cfg.asr_cal_fraction * dur))
-    raw_cal = raw.copy().crop(tmin=0, tmax=min(cal_dur, dur), include_tmax=False)
+    raw_cal = extract_clean_only_raw(raw)
+    if raw_cal.times[-1] > cal_dur:
+        raw_cal = raw_cal.crop(tmin=0, tmax=cal_dur)
 
     # Fit on calibration segment (Raw)
     asr.fit(raw_cal)
@@ -1374,6 +1419,8 @@ def run_pipeline(
     intermediates: Dict[str, mne.io.BaseRaw] = {"input": raw.copy()}
 
     def log_stage(name: str, func, *args, **kwargs):
+        global _psd_cache
+        _psd_cache.clear()
         bp_before = _bandpowers_dict(raw)
         t0 = time.time()
         out, rec = func(*args, **kwargs)
@@ -1404,7 +1451,7 @@ def run_pipeline(
     raw = log_stage("hardware_dropouts", mark_hardware_dropouts, raw)
 
     # 2. Line noise
-    raw = log_stage("line_noise", line_noise_bestof_safe, raw)
+    raw = log_stage("line_noise", line_noise_precise, raw)
 
 
     # 3. High-pass
@@ -1473,7 +1520,7 @@ def run_cohort(
     for path in file_paths:
         try:
             raw = mne.io.read_raw_fif(path, preload=True)
-            raw_clean, report = run_pipeline(raw, cfg, thr, logger=logger)
+            raw_clean, report, _  = run_pipeline(raw, cfg, thr, logger=logger)
             # Save outputs
             cleaned_path = outdir / (path.stem + "_cleaned.fif")
             report_path = outdir / (path.stem + "_report.json")
